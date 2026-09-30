@@ -1,0 +1,42 @@
+name: Augure review
+description: Run a bounded Augure code review through a provider adapter
+
+inputs:
+  provider:
+    description: Code-host provider adapter to use
+    required: false
+    default: github
+  model:
+    description: Augure model ID
+    required: true
+  prompt-file:
+    description: Repository-relative path to the review policy prompt
+    required: true
+  repository:
+    description: Provider repository identifier
+    required: true
+  change-number:
+    description: Pull or merge request number
+    required: true
+  base-ref:
+    description: Base branch name; origin/<base-ref> must exist
+    required: true
+  expected-head-sha:
+    description: Head commit that this run is allowed to review and publish
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run Augure review
+      shell: bash
+      env:
+        AUGURE_REVIEW_ACTION_ROOT: ${{ github.action_path }}
+        AUGURE_REVIEW_PROVIDER: ${{ inputs.provider }}
+        AUGURE_REVIEW_MODEL: ${{ inputs.model }}
+        AUGURE_REVIEW_PROMPT_FILE: ${{ inputs.prompt-file }}
+        AUGURE_REVIEW_REPOSITORY: ${{ inputs.repository }}
+        AUGURE_REVIEW_CHANGE_NUMBER: ${{ inputs.change-number }}
+        AUGURE_REVIEW_BASE_REF: ${{ inputs.base-ref }}
+        AUGURE_REVIEW_EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+      run: bash "$AUGURE_REVIEW_ACTION_ROOT/scripts/run-review.sh"
