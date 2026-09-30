@@ -8,7 +8,7 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from typing import Callable
 
 from . import gitdiff, planner, prompts, publish, review
@@ -20,9 +20,11 @@ from .settings import Settings
 from .state import RunState, append_summary, set_outputs
 
 AUTH_FAILURE = re.compile(r"\b(401 Unauthorized|403 Forbidden)\b")
-# Room for chunk headings, unit listings, and delimiters around the diff.
-FRAME_RESERVE = 4_000
-UNIT_LISTING_BYTES = 256
+QUOTA_FAILURE = re.compile(r"(?i)\b(daily limit reached|usage guard|usage limit)\b")
+# Room for a retry note appended to a rejected session's prompt.
+RETRY_RESERVE = 1_200
+# Room for headings, related-chunk lists, and delimiters, plus a retry note.
+FRAME_RESERVE = 4_000 + RETRY_RESERVE
 
 
 def _size(text: str) -> int:
@@ -93,7 +95,7 @@ class Pipeline:
         check: Callable[[dict], list[str]],
     ) -> dict | None:
         """Run a fresh session with bounded retries; return a validated result."""
-        total = _size(instructions) + _size(prompt)
+        total = _size(instructions) + _size(prompt) + RETRY_RESERVE
         if total > self.settings.chunk_budget_bytes:
             raise ReviewFailure(
                 "budget", f"{name} input is {total} bytes, over the {self.settings.chunk_budget_bytes}-byte budget"
@@ -105,7 +107,7 @@ class Pipeline:
             self._store(name, digest, resumed, resumed=True)
             return resumed
 
-        category, reason = "cli", "did not run"
+        category, reason, note = "cli", "did not run", ""
         for attempt in range(1, self.settings.max_attempts + 1):
             self.state.log(f"{name}: attempt {attempt} ({total} input bytes)")
             outcome = run_session(
@@ -113,14 +115,22 @@ class Pipeline:
                 name,
                 self.state.subdirectory("sessions", name, f"attempt-{attempt}"),
                 instructions,
-                prompt,
+                prompt + note,
                 self.schemas[stage],
                 self.state.log,
             )
+            if outcome.termination == "cancelled":
+                self._record(name, attempt, outcome, "cancelled", "the review was cancelled")
+                raise ReviewFailure("cancelled", "the review was cancelled")
             category, reason = self._classify(outcome)
+            # Account-level failures affect every session, so retrying wastes time and
+            # a partial review would misrepresent coverage.
             if any(AUTH_FAILURE.search(error) for error in outcome.errors):
                 self._record(name, attempt, outcome, "cli", "authentication failed")
                 raise ReviewFailure("cli", f"Augure rejected its credentials: {outcome.errors[-1][:300]}")
+            if any(QUOTA_FAILURE.search(error) for error in outcome.errors):
+                self._record(name, attempt, outcome, "quota", "usage limit reached")
+                raise ReviewFailure("quota", f"Augure usage limit reached: {outcome.errors[-1][:300]}")
             if category is None:
                 try:
                     result = parse_result(outcome.result_text, stage)
@@ -134,6 +144,12 @@ class Pipeline:
                 category, reason = "invalid-output", "; ".join(problems)[:1_000]
             self._record(name, attempt, outcome, category, reason)
             self.state.log(f"{name}: attempt {attempt} failed [{category}] {reason}")
+            if outcome.termination in ("tool-budget", "timeout"):
+                note = prompts.retry_note(reason, terminated=True)
+            elif category == "invalid-output":
+                note = prompts.retry_note(reason, terminated=False)
+            else:
+                note = ""
 
         with self._lock:
             self.failures.append({"session": name, "category": category, "reason": reason})
@@ -154,8 +170,10 @@ class Pipeline:
         pool = ThreadPoolExecutor(max_workers=self.settings.parallel_sessions)
         futures = [pool.submit(job) for job in jobs]
         try:
+            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
             for future in futures:
-                future.result()
+                if future in done and future.exception() is not None:
+                    raise future.exception()
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
@@ -252,7 +270,7 @@ class Pipeline:
         layer_map = planner.load_layer_map(self.settings.layer_map_file)
         self.plan = planner.build_plan(
             self.changes,
-            diff_budget - UNIT_LISTING_BYTES,
+            diff_budget,
             context_bytes,
             layer_map,
         )

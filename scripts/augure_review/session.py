@@ -16,6 +16,11 @@ from .settings import SECRET_VARIABLES, Settings
 TOOL_ITEM_TYPES = {"command_execution", "mcp_tool_call", "web_search", "file_change"}
 # The CLI needs its own credential; nothing else secret reaches the session.
 SESSION_SECRET_EXCLUSIONS = tuple(name for name in SECRET_VARIABLES if name != "AUGURE_TOKEN")
+# Set when the review is cancelled: running sessions are terminated and no new
+# session starts. Sessions run in their own process groups, so they would
+# otherwise outlive a cancelled orchestrator.
+CANCELLED = threading.Event()
+POLL_SECONDS = 1
 
 
 @dataclass
@@ -110,6 +115,9 @@ def run_session(
     (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
 
     outcome = SessionOutcome(name=name, exit_code=None, duration_seconds=0.0, tool_calls=0, termination=None)
+    if CANCELLED.is_set():
+        outcome.termination = "cancelled"
+        return outcome
     started = time.monotonic()
     with open(directory / "events.jsonl", "w") as events, open(directory / "stderr.log", "w") as stderr:
         process = subprocess.Popen(
@@ -158,13 +166,24 @@ def run_session(
         threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=watch, daemon=True)]
         for thread in threads:
             thread.start()
+        deadline = started + settings.session_timeout_seconds
         try:
-            process.wait(timeout=settings.session_timeout_seconds)
-        except subprocess.TimeoutExpired:
-            with lock:
-                if outcome.termination is None:
-                    outcome.termination = "timeout"
+            while process.poll() is None:
+                stop = "cancelled" if CANCELLED.is_set() else "timeout" if time.monotonic() >= deadline else None
+                if stop:
+                    with lock:
+                        if outcome.termination is None:
+                            outcome.termination = stop
+                    _terminate(process)
+                    break
+                try:
+                    process.wait(timeout=POLL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            # A cancellation raised in this thread must not orphan the session.
             _terminate(process)
+            raise
         process.wait()
         for thread in threads:
             thread.join(timeout=10)

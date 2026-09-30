@@ -13,6 +13,7 @@ MOCK_AUGURE_FAIL_PATH  chunks assigned this path always exit 1
 MOCK_AUGURE_FLOOD_PATH chunks assigned this path make unbounded tool calls
 MOCK_AUGURE_HANG_PATH  chunks assigned this path never finish
 MOCK_AUGURE_AUTH_FAIL  "1" to report 401 Unauthorized
+MOCK_AUGURE_QUOTA_PATH chunks assigned this path report an exhausted usage limit
 MOCK_AUGURE_UNRESOLVED "1" to leave an integration question unresolved
 MOCK_AUGURE_CARRY      JSON finding returned in carried_forward
 """
@@ -78,6 +79,7 @@ def main():
                 json.dumps(
                     {
                         "stage": stage,
+                        "pid": os.getpid(),
                         "args": args,
                         "leaked": leaked,
                         "instructions_exist": Path(instructions_file).is_file(),
@@ -98,6 +100,10 @@ def main():
     units = assigned(prompt) if stage == "chunk" else []
     paths = {path for _, path in units}
 
+    if stage == "chunk" and os.environ.get("MOCK_AUGURE_QUOTA_PATH") in paths:
+        emit({"type": "error", "message": "Daily limit reached (100% used) (Daily usage guard reached)"})
+        emit({"type": "turn.failed", "error": {"message": "Daily limit reached (100% used)"}})
+        return 1
     if stage == "chunk" and os.environ.get("MOCK_AUGURE_FAIL_PATH") in paths:
         emit({"type": "turn.failed", "error": {"message": "mock failure"}})
         return 1

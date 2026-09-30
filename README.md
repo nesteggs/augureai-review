@@ -63,7 +63,7 @@ The runner needs Bash, Git, Python 3.10 or later, curl, tar, the GitHub CLI, and
 
 If a pull request has no clear intent, the action comments once and fails with `missing-intent`.
 
-Every session has a wall-clock limit (`session-timeout-minutes`) and a tool-call limit (`session-max-tool-calls`), and the action terminates any session that exceeds either one. Only failed or invalid sessions are retried, up to `max-attempts`. Repository contents and PR text are passed to sessions as delimited, untrusted data. Sessions receive `AUGURE_TOKEN` and no other credential.
+Every session has a wall-clock limit (`session-timeout-minutes`) and a tool-call limit (`session-max-tool-calls`), and the action terminates any session that exceeds either one. Only failed or invalid sessions are retried, up to `max-attempts`; a retry after a budget termination is told to work from the diff with fewer calls. Cancelling the workflow terminates running sessions and reports `cancelled`. Repository contents and PR text are passed to sessions as delimited, untrusted data. Sessions receive `AUGURE_TOKEN` and no other credential.
 
 ### Inputs
 
@@ -73,7 +73,7 @@ Every session has a wall-clock limit (`session-timeout-minutes`) and a tool-call
 | `augure-sha256` | | Optional pinned SHA-256 of the runner platform's release tarball. |
 | `chunk-budget-bytes` | `120000` | Maximum instructions and input for any one session. |
 | `session-timeout-minutes` | `12` | Wall-clock limit per session. |
-| `session-max-tool-calls` | `12` | Tool calls per session before termination. |
+| `session-max-tool-calls` | `20` | Tool calls per session before termination. |
 | `max-attempts` | `2` | Attempts per failed session. |
 | `parallel-sessions` | `2` | Concurrent sessions. |
 | `max-integration-passes` | `6` | Integration sessions per run. |
@@ -88,7 +88,7 @@ Every session has a wall-clock limit (`session-timeout-minutes`) and a tool-call
 Outputs:
 
 - `review-id`, `review-url`, and `event`: the published review;
-- `failure-category`: one of `configuration`, `git`, `provider`, `missing-intent`, `budget`, `cli`, `invalid-output`, `coverage`, `stale-head`, `publication`, or `internal`;
+- `failure-category`: one of `configuration`, `git`, `provider`, `missing-intent`, `budget`, `cli`, `quota`, `invalid-output`, `coverage`, `stale-head`, `publication`, `cancelled`, or `internal`;
 - `artifacts-path`.
 
 The artifact contains the following, with secret values redacted:

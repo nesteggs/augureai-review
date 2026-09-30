@@ -43,7 +43,7 @@ inputs:
   session-max-tool-calls:
     description: Shell tool calls allowed in each review session before it is terminated
     required: false
-    default: "12"
+    default: "20"
   max-attempts:
     description: Attempts for each failed or invalid review session
     required: false

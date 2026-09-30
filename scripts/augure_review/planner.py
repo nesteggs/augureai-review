@@ -42,6 +42,15 @@ DEFAULT_LAYER_PATTERNS = {
 }
 
 
+# Per-unit prompt framing: the assigned-unit listing line and the untrusted
+# delimiters around the unit's diff, excluding the path itself.
+UNIT_FRAME_BYTES = 320
+
+
+def unit_frame(change: FileChange) -> int:
+    return UNIT_FRAME_BYTES + 2 * len(change.path.encode()) + len((change.old_path or "").encode())
+
+
 @dataclass
 class Unit:
     id: str
@@ -314,7 +323,7 @@ def build_plan(
         path_role = role(change.path)
         rank = {"source": 0, "test": 1, "doc": 2}[path_role]
         key = (posixpath.dirname(anchor), anchor, rank, change.path, sequence)
-        context = min(file_context_bytes.get(change.path, 0), diff_budget // 4)
+        context = min(file_context_bytes.get(change.path, 0), diff_budget // 4) + unit_frame(change)
         for piece_index, (description, hunks, part, text) in enumerate(file_units(change, diff_budget, context)):
             ordered.append((key + (piece_index,), change.path, description, hunks, part, text, context, path_role))
     ordered.sort(key=lambda item: item[0])

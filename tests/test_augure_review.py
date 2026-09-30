@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from augure_review import gitdiff, planner, prompts, publish, review, schemas  # noqa: E402
 from augure_review.errors import ReviewFailure  # noqa: E402
 from augure_review.pipeline import Pipeline  # noqa: E402
+from augure_review.session import CANCELLED  # noqa: E402
 from augure_review.settings import Settings  # noqa: E402
 from augure_review.state import RunState, redact_tree  # noqa: E402
 
@@ -393,6 +396,12 @@ class PromptTests(unittest.TestCase):
         self.assertIn("at most 7 shell tool calls", text)
         self.assertIn("Never publish", text)
 
+    def test_instructions_state_the_output_schema(self):
+        text = prompts.instructions("intent", "policy", 5, 12)
+
+        self.assertIn('"has_clear_intent"', text)
+        self.assertIn('"additionalProperties":false', text)
+
     def test_prior_comment_cycles_terminate(self):
         comments = [
             {"id": 1, "in_reply_to_id": 2, "path": "a.py", "body": "x"},
@@ -584,7 +593,24 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.published()[0]["state"], "APPROVED")
         failed = [o for o in pipeline.outcomes if o.get("failure")]
         self.assertEqual([o["failure"] for o in failed], ["invalid-output"])
-        self.assertTrue(any((self.state_dir / "sessions").glob("chunk-*/attempt-2/prompt.md")))
+        retry_prompt = next((self.state_dir / "sessions").glob("chunk-*/attempt-2/prompt.md")).read_text()
+        self.assertIn("Previous attempt rejected", retry_prompt)
+        self.assertIn("final message is not JSON", retry_prompt)
+
+    def test_many_small_files_stay_within_the_session_budget(self):
+        for number in range(150):
+            write(self.repo, f"pkg/module_with_a_long_descriptive_name_{number:03d}.py", f"VALUE = {number}\n")
+        self.head = commit(self.repo, "many")
+        pull = json.loads((self.gh_dir / "pull.json").read_text())
+        pull["head"]["sha"] = self.head
+        (self.gh_dir / "pull.json").write_text(json.dumps(pull))
+
+        pipeline, failure = self.run_pipeline(chunk_budget_bytes=30_000)
+
+        self.assertIsNone(failure)
+        self.assertGreater(len(pipeline.plan.chunks), 1)
+        largest = max(session["prompt_bytes"] for session in self.sessions() if session["stage"] == "chunk")
+        self.assertLess(largest, 30_000)
 
     def test_failed_chunk_publishes_comment_and_fails(self):
         self.add_large_change()
@@ -612,6 +638,42 @@ class PipelineTests(unittest.TestCase):
         flooded = next(o for o in pipeline.outcomes if o["termination"] == "tool-budget")
         self.assertEqual(flooded["tool_calls"], 6)
         self.assertEqual(self.published()[0]["state"], "COMMENTED")
+
+    def test_budget_retry_is_told_to_use_fewer_calls(self):
+        self.add_large_change()
+
+        _, failure = self.run_pipeline({"MOCK_AUGURE_FLOOD_PATH": "web/page.tsx"}, chunk_budget_bytes=30_000)
+
+        self.assertEqual(failure.category, "cli")
+        flooded = next(p for p in (self.state_dir / "sessions").glob("chunk-*/attempt-2/prompt.md"))
+        retry_prompt = flooded.read_text()
+        self.assertIn("Previous attempt terminated", retry_prompt)
+        self.assertIn("exceeded the tool-call budget", retry_prompt)
+        self.assertNotIn("Previous attempt", (flooded.parent.parent / "attempt-1" / "prompt.md").read_text())
+
+    def test_cancellation_terminates_running_sessions(self):
+        self.addCleanup(CANCELLED.clear)
+        log = Path(self.environment["MOCK_AUGURE_LOG"])
+
+        def cancel_when_a_chunk_hangs():
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and '"chunk"' not in (log.read_text() if log.exists() else ""):
+                time.sleep(0.05)
+            CANCELLED.set()
+
+        canceller = threading.Thread(target=cancel_when_a_chunk_hangs)
+        canceller.start()
+        started = time.monotonic()
+        pipeline, failure = self.run_pipeline({"MOCK_AUGURE_HANG_PATH": "web/page.tsx"})
+        canceller.join()
+
+        self.assertEqual(failure.category, "cancelled")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertTrue(any(o.get("termination") == "cancelled" for o in pipeline.outcomes))
+        self.assertEqual(self.published(), [])
+        for session in self.sessions():
+            with self.assertRaises(ProcessLookupError):
+                os.kill(session["pid"], 0)
 
     def test_every_chunk_failing_publishes_nothing(self):
         _, failure = self.run_pipeline({"MOCK_AUGURE_FAIL_PATH": "web/page.tsx"})
@@ -668,6 +730,18 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(failure.category, "cli")
         self.assertEqual(len(self.sessions()), 1)
+        self.assertEqual(self.published(), [])
+
+    def test_usage_limit_stops_the_review_without_publishing(self):
+        self.add_large_change()
+
+        _, failure = self.run_pipeline(
+            {"MOCK_AUGURE_QUOTA_PATH": "web/page.tsx"}, chunk_budget_bytes=30_000, parallel_sessions=1
+        )
+
+        self.assertEqual(failure.category, "quota")
+        self.assertEqual(list(self.state_dir.glob("sessions/*/attempt-2")), [])
+        self.assertNotIn("integration", [s["stage"] for s in self.sessions()])
         self.assertEqual(self.published(), [])
 
     def test_resume_reuses_matching_results_only(self):

@@ -164,7 +164,7 @@ test_state_dir_must_be_empty() {
   assert_succeeds prepare_state_dir "$test_dir/new"
 }
 
-test_main_with_mocks() {
+prepare_mock_run() {
   local test_dir="$1"
   local repo="$test_dir/repo"
   mkdir -p "$test_dir/bin" "$test_dir/release" "$test_dir/gh" "$test_dir/runner-temp" "$repo"
@@ -180,25 +180,39 @@ test_main_with_mocks() {
   git -C "$repo" update-ref refs/remotes/origin/main HEAD
   printf 'def main(value):\n    return value\n' >"$repo/app.py"
   git -C "$repo" commit -qam head
-  local head
-  head="$(git -C "$repo" rev-parse HEAD)"
+  MOCK_HEAD="$(git -C "$repo" rev-parse HEAD)"
   printf '{"title":"feat: [#1] x","body":"Intent: x","user":{"login":"a"},"head":{"sha":"%s"},"base":{"ref":"main"}}\n' \
-    "$head" >"$test_dir/gh/pull.json"
+    "$MOCK_HEAD" >"$test_dir/gh/pull.json"
+}
 
-  local status=0
+# Runs the action script against the mock repository, as the action does;
+# extra arguments are exported first.
+run_main_with_mocks() {
+  local test_dir="$1"
+  shift
   (
-    cd "$repo"
+    cd "$test_dir/repo"
     valid_inputs
     export PATH="$test_dir/bin:$PATH"
     export RUNNER_TEMP="$test_dir/runner-temp"
     export MOCK_RELEASE_DIR="$test_dir/release"
     export MOCK_GH_DIR="$test_dir/gh"
     export MOCK_AUGURE_LOG="$test_dir/augure.log"
-    export AUGURE_REVIEW_EXPECTED_HEAD_SHA="$head"
+    export AUGURE_REVIEW_EXPECTED_HEAD_SHA="$MOCK_HEAD"
     export AUGURE_REVIEW_STATE_DIR="$test_dir/state"
     export GITHUB_OUTPUT="$test_dir/output"
-    main
-  ) >"$test_dir/main.log" 2>&1 || status=$?
+    if (($#)); then export "$@"; fi
+    printf '%s\n' "$BASHPID" >"$test_dir/runner.pid"
+    exec bash "$TEST_ROOT/scripts/run-review.sh"
+  )
+}
+
+test_main_with_mocks() {
+  local test_dir="$1"
+  prepare_mock_run "$test_dir"
+
+  local status=0
+  run_main_with_mocks "$test_dir" >"$test_dir/main.log" 2>&1 || status=$?
   [[ "$status" == 0 ]] || { cat "$test_dir/main.log" >&2; fail "main exited with $status"; }
 
   grep -Fq 'event=APPROVE' "$test_dir/output" || fail 'main did not report the published event'
@@ -216,6 +230,31 @@ test_main_with_mocks() {
   fi
 }
 
+test_cancellation_stops_sessions() {
+  local test_dir="$1"
+  prepare_mock_run "$test_dir"
+  run_main_with_mocks "$test_dir" MOCK_AUGURE_HANG_PATH=app.py >"$test_dir/main.log" 2>&1 &
+  local runner=$!
+  local waited=0
+  until grep -Fq '"stage": "chunk"' "$test_dir/augure.log" 2>/dev/null; do
+    ((waited++ < 200)) || { kill "$runner"; fail 'the chunk session never started'; }
+    sleep 0.1
+  done
+  kill -TERM "$(<"$test_dir/runner.pid")"
+  local status=0
+  wait "$runner" || status=$?
+  [[ "$status" != 0 ]] || fail 'a cancelled review must fail'
+  grep -Fq '"failure_category": "cancelled"' "$test_dir/state/status.json" ||
+    { cat "$test_dir/main.log" >&2; fail 'cancellation was not recorded'; }
+  local pid
+  pid="$(grep -F '"stage": "chunk"' "$test_dir/augure.log" | python3 -c 'import json, sys; print(json.loads(sys.stdin.readline())["pid"])')"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid"
+    fail 'the chunk session outlived the cancelled review'
+  fi
+  [[ ! -f "$test_dir/gh/reviews.json" ]] || fail 'a cancelled review must not publish'
+}
+
 test_token_validation
 test_input_validation
 test_review_policy
@@ -225,5 +264,8 @@ test_state_dir_must_be_empty
 integration_dir="$(mktemp -d)"
 trap 'rm -rf "$integration_dir"' EXIT
 test_main_with_mocks "$integration_dir"
+cancel_dir="$(mktemp -d)"
+trap 'rm -rf "$integration_dir" "$cancel_dir"' EXIT
+test_cancellation_stops_sessions "$cancel_dir"
 python3 -m unittest discover -b -s "$TEST_ROOT/tests"
 printf 'augure-review tests passed\n'

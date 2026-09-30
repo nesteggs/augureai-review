@@ -95,7 +95,7 @@ def load_settings() -> Settings:
         chunk_budget_bytes=_int_env("AUGURE_REVIEW_CHUNK_BUDGET_BYTES", 120_000, 16_000, 4_000_000),
         session_timeout_seconds=60
         * _int_env("AUGURE_REVIEW_SESSION_TIMEOUT_MINUTES", 12, 1, 120),
-        session_max_tool_calls=_int_env("AUGURE_REVIEW_SESSION_MAX_TOOL_CALLS", 12, 1, 200),
+        session_max_tool_calls=_int_env("AUGURE_REVIEW_SESSION_MAX_TOOL_CALLS", 20, 1, 200),
         max_attempts=_int_env("AUGURE_REVIEW_MAX_ATTEMPTS", 2, 1, 5),
         parallel_sessions=_int_env("AUGURE_REVIEW_PARALLEL_SESSIONS", 2, 1, 16),
         max_integration_passes=_int_env("AUGURE_REVIEW_MAX_INTEGRATION_PASSES", 6, 0, 50),

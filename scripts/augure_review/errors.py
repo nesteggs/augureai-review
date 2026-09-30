@@ -7,10 +7,12 @@ CATEGORIES = (
     "missing-intent",
     "budget",
     "cli",
+    "quota",
     "invalid-output",
     "coverage",
     "stale-head",
     "publication",
+    "cancelled",
     "internal",
 )
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass
 
 from .planner import Chunk, Plan
+from .schemas import SCHEMAS
 
 PR_BODY_LIMIT = 16_000
 COMMENT_LIMIT = 1_500
@@ -69,8 +71,12 @@ task runners. You may read files with non-executing tools and inspect git diff,
 log, show, and grep output for the frozen commits named in the task.
 
 You may make at most {max_tool_calls} shell tool calls. The orchestrator
-terminates a session that exceeds that limit or {timeout_minutes} minutes. Batch
-related reads and stop inspecting once you can answer.
+terminates a session that exceeds that limit or {timeout_minutes} minutes, and a
+terminated session's work is lost. The supplied diff is your primary evidence;
+read other files only to prove or rule out a specific suspected problem. Combine
+related reads into a single command, for example one sed or grep over several
+files. Stop inspecting once you can answer, and record anything you could not
+verify in the fields for questions or unresolved work instead of reading further.
 
 Base every claim on the supplied diff or on files you read in this session.
 Never cite files, logs, identifiers, or events you did not observe. When you
@@ -154,7 +160,32 @@ commit, you verified that in this session, and it is not already a candidate.
 
 
 def instructions(stage: str, policy: str, max_tool_calls: int, timeout_minutes: int) -> str:
-    return f"{policy.rstrip()}\n\n{_contract(max_tool_calls, timeout_minutes)}\n{STAGES[stage].rstrip()}\n"
+    # The CLI's output-schema option is not enforced by every model endpoint,
+    # so the schema is also stated where the model can read it.
+    schema = json.dumps(SCHEMAS[stage], separators=(",", ":"))
+    return (
+        f"{policy.rstrip()}\n\n{_contract(max_tool_calls, timeout_minutes)}\n{STAGES[stage].rstrip()}\n\n"
+        "## Output schema\n\n"
+        "Your final message must be a single JSON object that validates against this JSON Schema. Use exactly "
+        "these property names, include every property, and add no others.\n\n"
+        f"```json\n{schema}\n```\n"
+    )
+
+
+def retry_note(reason: str, terminated: bool) -> str:
+    if terminated:
+        return (
+            "\n## Previous attempt terminated\n\n"
+            f"A previous session for this task was terminated because it {clip(reason, 300)}.\n"
+            "Work from the supplied diff. Use at most half of the tool-call limit, combine reads into\n"
+            "single commands, and record anything you could not verify in the fields for questions or\n"
+            "unresolved work instead of reading further.\n"
+        )
+    return (
+        "\n## Previous attempt rejected\n\n"
+        f"A previous session for this task returned output that was rejected: {clip(reason, 1_000)}\n"
+        "Return only a JSON object that matches the output schema exactly.\n"
+    )
 
 
 def pull_request_header(context: ReviewContext, include_intent: bool = True) -> str:

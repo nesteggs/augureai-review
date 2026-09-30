@@ -174,12 +174,24 @@ main() {
   export AUGURE_HOME="$work/augure-home"
   export CODEX_HOME="$AUGURE_HOME"
 
-  install_augure "$AUGURE_REVIEW_CLI_VERSION" "$work"
   write_augure_config "$AUGURE_HOME" "$AUGURE_REVIEW_MODEL"
+  install_augure "$AUGURE_REVIEW_CLI_VERSION" "$work"
   cp "$AUGURE_HOME/config.toml" "$AUGURE_REVIEW_STATE_DIR/augure-config.toml"
 
+  # The runner signals only this shell on cancellation. Forward it so that the
+  # orchestrator can stop its sessions and record the cancellation.
   PYTHONPATH="$AUGURE_REVIEW_ACTION_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m augure_review
+    python3 -m augure_review &
+  AUGURE_REVIEW_PID=$!
+  trap 'kill -TERM "$AUGURE_REVIEW_PID" 2>/dev/null || true' TERM INT
+  local status=0
+  wait "$AUGURE_REVIEW_PID" || status=$?
+  # A trapped signal interrupts wait before the orchestrator has finished.
+  while kill -0 "$AUGURE_REVIEW_PID" 2>/dev/null; do
+    status=0
+    wait "$AUGURE_REVIEW_PID" || status=$?
+  done
+  return "$status"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
