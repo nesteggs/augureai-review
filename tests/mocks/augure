@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Mock Augure CLI for tests.
+
+Behavior is controlled through environment variables:
+
+MOCK_AUGURE_LOG        file that receives one JSON line per exec invocation
+MOCK_AUGURE_STATE      directory for per-scenario counters
+MOCK_AUGURE_INTENT     "unclear" to report missing intent
+MOCK_AUGURE_FINDINGS   JSON list of findings added to the chunk that owns each path
+MOCK_AUGURE_VERDICT    verdict for every verification candidate (default confirmed)
+MOCK_AUGURE_INVALID_ONCE  stage whose first session returns non-JSON output
+MOCK_AUGURE_FAIL_PATH  chunks assigned this path always exit 1
+MOCK_AUGURE_FLOOD_PATH chunks assigned this path make unbounded tool calls
+MOCK_AUGURE_HANG_PATH  chunks assigned this path never finish
+MOCK_AUGURE_AUTH_FAIL  "1" to report 401 Unauthorized
+MOCK_AUGURE_UNRESOLVED "1" to leave an integration question unresolved
+MOCK_AUGURE_CARRY      JSON finding returned in carried_forward
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+def option(args, name):
+    for index, value in enumerate(args):
+        if value == name:
+            return args[index + 1]
+    return None
+
+
+def counter(name):
+    directory = Path(os.environ.get("MOCK_AUGURE_STATE", "/tmp"))
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.count"
+    count = int(path.read_text()) if path.exists() else 0
+    path.write_text(str(count + 1))
+    return count
+
+
+def assigned(prompt):
+    section = prompt.split("### Assigned units", 1)[1].split("###", 1)[0]
+    return re.findall(r"^- (U\d{3}): (\S+)", section, re.MULTILINE)
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--version"]:
+        print(f"augure {os.environ.get('MOCK_AUGURE_VERSION', '1.0.7')}")
+        return 0
+    if "exec" not in args:
+        print("mock augure: expected exec", file=sys.stderr)
+        return 2
+
+    schema = option(args, "--output-schema")
+    result_path = option(args, "--output-last-message")
+    config = option(args, "-c")
+    stage = Path(schema).name.split(".")[0]
+    prompt = sys.stdin.read()
+    instructions_file = json.loads(config.split("=", 1)[1])
+    leaked = [
+        name
+        for name in ("REVIEW_PROVIDER_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+        if os.environ.get(name)
+    ]
+
+    log = os.environ.get("MOCK_AUGURE_LOG")
+    if log:
+        with open(log, "a") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "stage": stage,
+                        "args": args,
+                        "leaked": leaked,
+                        "instructions_exist": Path(instructions_file).is_file(),
+                        "prompt_bytes": len(prompt.encode()),
+                    }
+                )
+                + "\n"
+            )
+
+    emit({"type": "thread.started", "thread_id": "mock"})
+    emit({"type": "turn.started"})
+
+    if os.environ.get("MOCK_AUGURE_AUTH_FAIL") == "1":
+        emit({"type": "error", "message": "Reconnecting... 1/5 (unexpected status 401 Unauthorized)"})
+        emit({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized"}})
+        return 1
+
+    units = assigned(prompt) if stage == "chunk" else []
+    paths = {path for _, path in units}
+
+    if stage == "chunk" and os.environ.get("MOCK_AUGURE_FAIL_PATH") in paths:
+        emit({"type": "turn.failed", "error": {"message": "mock failure"}})
+        return 1
+    if stage == "chunk" and os.environ.get("MOCK_AUGURE_FLOOD_PATH") in paths:
+        for number in range(1000):
+            emit({"type": "item.started", "item": {"id": str(number), "type": "command_execution", "command": "ls"}})
+            time.sleep(0.01)
+        return 0
+    if stage == "chunk" and os.environ.get("MOCK_AUGURE_HANG_PATH") in paths:
+        time.sleep(600)
+        return 0
+
+    if os.environ.get("MOCK_AUGURE_INVALID_ONCE") == stage and counter(f"invalid-{stage}") == 0:
+        Path(result_path).write_text("I reviewed the code and it looks fine.\n")
+        emit({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}})
+        return 0
+
+    emit({"type": "item.started", "item": {"id": "1", "type": "command_execution", "command": "git diff"}})
+    emit({"type": "item.completed", "item": {"id": "1", "type": "command_execution", "exit_code": 0}})
+
+    if stage == "intent":
+        if os.environ.get("MOCK_AUGURE_INTENT") == "unclear":
+            result = {"has_clear_intent": False, "intent": "", "goals": [], "reason": "The body is empty."}
+        else:
+            result = {"has_clear_intent": True, "intent": "Add a feature.", "goals": ["Works"], "reason": ""}
+    elif stage == "chunk":
+        findings = [
+            finding
+            for finding in json.loads(os.environ.get("MOCK_AUGURE_FINDINGS", "[]"))
+            if finding["path"] in paths
+        ]
+        result = {
+            "status": "complete",
+            "summary": "Reviewed.",
+            "units_reviewed": [unit for unit, _ in units],
+            "incomplete": [],
+            "findings": findings,
+            "prior_findings": [],
+            "interfaces_changed": [],
+            "assumptions": [],
+            "questions": [],
+        }
+    elif stage == "integration":
+        unresolved = []
+        if os.environ.get("MOCK_AUGURE_UNRESOLVED") == "1":
+            unresolved = [{"description": "Does the caller handle null?", "paths": []}]
+        result = {"status": "complete", "summary": "Integrated.", "findings": [], "answers": [], "unresolved": unresolved}
+    elif stage == "verification":
+        verdict = os.environ.get("MOCK_AUGURE_VERDICT", "confirmed")
+        ids = re.findall(r"^ID: (F\d{3})$", prompt, re.MULTILINE)
+        carried = json.loads(os.environ["MOCK_AUGURE_CARRY"]) if os.environ.get("MOCK_AUGURE_CARRY") else None
+        result = {
+            "verdicts": [
+                {
+                    "finding_id": finding_id,
+                    "verdict": verdict,
+                    "severity": "pebble" if verdict == "downgraded" else "boulder",
+                    "evidence": "Checked.",
+                }
+                for finding_id in ids
+            ],
+            "carried_forward": [carried] if carried else [],
+            "summary": "Verified.",
+        }
+    else:
+        print(f"mock augure: unknown stage {stage}", file=sys.stderr)
+        return 2
+
+    Path(result_path).write_text(json.dumps(result))
+    emit({"type": "item.completed", "item": {"id": "2", "type": "agent_message", "text": json.dumps(result)}})
+    emit({"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 30}})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

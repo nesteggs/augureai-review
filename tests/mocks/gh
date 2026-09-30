@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Mock gh CLI that serves one pull request from MOCK_GH_DIR.
+
+MOCK_GH_DIR/pull.json      pull request object (title, body, user, head, base)
+MOCK_GH_DIR/reviews.json   list of reviews; published reviews are appended
+MOCK_GH_DIR/comments.json  list of review comments
+MOCK_GH_DIR/head-after-publish-count  optional: head SHA returned after N head reads
+MOCK_GH_FAIL_PUBLISH       "1" to fail publication
+MOCK_GH_WRONG_STATE        "1" to return a mismatched review state
+"""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+DIRECTORY = Path(os.environ["MOCK_GH_DIR"])
+
+
+def load(name, default):
+    path = DIRECTORY / name
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def save(name, value):
+    (DIRECTORY / name).write_text(json.dumps(value, indent=2))
+
+
+def main():
+    args = sys.argv[1:]
+    with open(DIRECTORY / "calls.log", "a") as handle:
+        handle.write(json.dumps({"args": args, "token": os.environ.get("GH_TOKEN", "")}) + "\n")
+    if not args or args[0] != "api":
+        print("mock gh: only api is supported", file=sys.stderr)
+        return 2
+
+    method = "GET"
+    jq = None
+    payload_file = None
+    endpoint = None
+    rest = args[1:]
+    index = 0
+    while index < len(rest):
+        value = rest[index]
+        if value == "--method":
+            method = rest[index + 1]
+            index += 2
+        elif value == "--jq":
+            jq = rest[index + 1]
+            index += 2
+        elif value == "--input":
+            payload_file = rest[index + 1]
+            index += 2
+        elif value == "--paginate":
+            index += 1
+        else:
+            endpoint = value
+            index += 1
+
+    pull = load("pull.json", {})
+    match = re.fullmatch(r"repos/[^/]+/[^/]+/pulls/(\d+)(/.*)?", endpoint or "")
+    if not match:
+        print(f"mock gh: unexpected endpoint {endpoint}", file=sys.stderr)
+        return 1
+    suffix = match.group(2) or ""
+
+    if suffix == "" and method == "GET":
+        reads = load("head-reads.json", 0) + 1
+        save("head-reads.json", reads)
+        changed = load("head-change.json", None)
+        if changed and reads >= changed["after"]:
+            pull["head"]["sha"] = changed["sha"]
+        value = pull
+    elif suffix == "/reviews" and method == "GET":
+        value = load("reviews.json", [])
+    elif suffix == "/comments" and method == "GET":
+        value = load("comments.json", [])
+    elif suffix == "/reviews" and method == "POST":
+        if os.environ.get("MOCK_GH_FAIL_PUBLISH") == "1":
+            print("gh: HTTP 422: Unprocessable Entity", file=sys.stderr)
+            return 1
+        payload = json.loads(Path(payload_file).read_text())
+        reviews = load("reviews.json", [])
+        states = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}
+        state = "PENDING" if os.environ.get("MOCK_GH_WRONG_STATE") == "1" else states[payload["event"]]
+        review = {
+            "id": 1000 + len(reviews),
+            "user": {"login": "augure-bot"},
+            "state": state,
+            "body": payload["body"],
+            "commit_id": payload["commit_id"],
+            "submitted_at": "2026-09-29T00:00:00Z",
+            "html_url": f"https://github.com/acme/example/pull/42#pullrequestreview-{1000 + len(reviews)}",
+        }
+        reviews.append(review)
+        save("reviews.json", reviews)
+        save(f"payload-{review['id']}.json", payload)
+        value = review
+    elif suffix.startswith("/reviews/") and method == "GET":
+        review_id = int(suffix.rsplit("/", 1)[1])
+        value = next((r for r in load("reviews.json", []) if r["id"] == review_id), None)
+        if value is None:
+            print("gh: HTTP 404: Not Found", file=sys.stderr)
+            return 1
+    else:
+        print(f"mock gh: unexpected {method} {endpoint}", file=sys.stderr)
+        return 1
+
+    if jq == ".head.sha":
+        print(value["head"]["sha"])
+    elif jq == ".[]":
+        for item in value:
+            print(json.dumps(item))
+    elif jq is None:
+        print(json.dumps(value))
+    else:
+        print(f"mock gh: unsupported jq {jq}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

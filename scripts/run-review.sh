@@ -2,11 +2,16 @@
 
 set -euo pipefail
 
-readonly PUBLISHED_MARKER="AUGURE_REVIEW_PUBLISHED"
-readonly MISSING_INTENT_MARKER="AUGURE_REVIEW_BLOCKED_MISSING_INTENT"
+readonly AUGURE_RELEASE_URL="https://updates.augureai.ca/augure-code"
 
 die() {
-  printf 'augure-review: %s\n' "$*" >&2
+  printf 'augure-review: [configuration] %s\n' "$*" >&2
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '::error title=Augure review failed (configuration)::%s\n' "$*" >&2
+  fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf 'failure-category=configuration\n' >>"$GITHUB_OUTPUT"
+  fi
   exit 1
 }
 
@@ -32,6 +37,10 @@ validate_inputs() {
   [[ "${AUGURE_REVIEW_CHANGE_NUMBER:-}" =~ ^[1-9][0-9]*$ ]] || die "change number must be a positive integer"
   [[ -n "${AUGURE_REVIEW_BASE_REF:-}" ]] || die "base ref is required"
   [[ "${AUGURE_REVIEW_EXPECTED_HEAD_SHA:-}" =~ ^[0-9a-fA-F]{40}$ ]] || die "expected head SHA must contain 40 hexadecimal characters"
+  [[ "${AUGURE_REVIEW_CLI_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Augure version must be a release number such as 1.0.7"
+  [[ -z "${AUGURE_REVIEW_CLI_SHA256:-}" || "$AUGURE_REVIEW_CLI_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+    die "Augure SHA-256 must contain 64 lowercase hexadecimal characters"
+  [[ -n "${AUGURE_REVIEW_STATE_DIR:-}" ]] || die "state directory is required"
   [[ -n "${REVIEW_PROVIDER_TOKEN:-}" ]] || die "REVIEW_PROVIDER_TOKEN is required"
   validate_augure_token "${AUGURE_TOKEN:-}"
 
@@ -39,24 +48,67 @@ validate_inputs() {
   [[ -f "$adapter" ]] || die "unsupported provider: $AUGURE_REVIEW_PROVIDER"
 }
 
+platform_slug() {
+  local os arch
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) die "unsupported runner operating system: $(uname -s)" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *) die "unsupported runner architecture: $(uname -m)" ;;
+  esac
+  printf '%s-%s' "$os" "$arch"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# The release server publishes only its current build, so the pinned version is
+# enforced by checking the advertised release and the installed binary rather
+# than by selecting an older download.
 install_augure() {
-  local installer="$1/install.sh"
+  local version="$1"
+  local work="$2"
+  local tarball published expected actual reported
 
   require_command curl
-  curl -fsSL --retry 3 https://augureai.ca/install.sh -o "$installer"
-  AUGURE_NON_INTERACTIVE=1 sh "$installer"
+  require_command tar
+  require_command jq
+  tarball="augure-$(platform_slug).tar.gz"
+  mkdir -p "$work/bin"
 
-  if ! command -v augure >/dev/null 2>&1 && [[ -x "$HOME/.local/bin/augure" ]]; then
-    export PATH="$HOME/.local/bin:$PATH"
+  published="$(curl -fsSL --retry 3 "$AUGURE_RELEASE_URL/latest.json" | jq -r '.version // empty')"
+  [[ "$published" == "$version" ]] ||
+    die "pinned Augure $version is unavailable; the release server publishes ${published:-an unknown version}. Update augure-version after validating that release."
+
+  curl -fsSL --retry 3 "$AUGURE_RELEASE_URL/$tarball" -o "$work/$tarball"
+  expected="$(curl -fsSL --retry 3 "$AUGURE_RELEASE_URL/$tarball.sha256" | awk '{print $1}')"
+  actual="$(sha256_of "$work/$tarball")"
+  [[ -n "$expected" && "$actual" == "$expected" ]] || die "Augure download checksum does not match the published checksum"
+  if [[ -n "${AUGURE_REVIEW_CLI_SHA256:-}" && "$actual" != "$AUGURE_REVIEW_CLI_SHA256" ]]; then
+    die "Augure download checksum $actual does not match the pinned augure-sha256"
   fi
-  require_command augure
-  augure --version
+
+  tar -xzf "$work/$tarball" -C "$work/bin" augure
+  chmod +x "$work/bin/augure"
+  export PATH="$work/bin:$PATH"
+
+  reported="$(augure --version)"
+  [[ "$reported" == "augure $version" ]] || die "installed Augure reports '$reported', expected 'augure $version'"
+  printf 'augure-review: installed %s (sha256 %s)\n' "$reported" "$actual"
 }
 
 write_augure_config() {
   local config_dir="$1"
-  local instructions_file="$2"
-  local model="$3"
+  local model="$2"
   local context_window_line=""
 
   case "$model" in
@@ -71,15 +123,10 @@ model_provider = "augure_ci"
 $context_window_line
 default_permissions = "review"
 check_for_update_on_startup = false
-model_instructions_file = "$instructions_file"
 
 [permissions.review]
-description = "Read-only pull request review with provider API access"
+description = "Read-only pull request review; publication is performed by the orchestrator"
 extends = ":read-only"
-
-[permissions.review.network]
-enabled = true
-mode = "full"
 
 [model_providers.augure_ci]
 name = "Augure CI"
@@ -90,75 +137,49 @@ requires_openai_auth = false
 
 [shell_environment_policy]
 inherit = "all"
-exclude = ["AUGURE_TOKEN", "AUGURE_API_KEY", "OPENAI_API_KEY", "REVIEW_PROVIDER_TOKEN"]
+exclude = ["AUGURE_TOKEN", "AUGURE_API_KEY", "OPENAI_API_KEY", "REVIEW_PROVIDER_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
 EOF
   chmod 600 "$config_dir/config.toml"
 }
 
-build_prompt() {
-  local output_file="$1"
-
-  cat "$AUGURE_REVIEW_PROMPT_FILE" >"$output_file"
-  printf '\n\n' >>"$output_file"
-  provider_prompt >>"$output_file"
-}
-
-check_result() {
-  local result_file="$1"
-
-  if grep -Fxq "$PUBLISHED_MARKER" "$result_file"; then
-    return 0
+prepare_state_dir() {
+  local state_dir="$1"
+  if [[ -e "$state_dir" ]] && [[ -n "$(ls -A "$state_dir" 2>/dev/null)" ]]; then
+    die "state directory already contains files: $state_dir"
   fi
-
-  if grep -Fxq "$MISSING_INTENT_MARKER" "$result_file"; then
-    die "review stopped because the pull request has no clear intent or goals"
-  fi
-
-  die "Augure did not confirm that it published a complete review"
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
 }
 
 main() {
   validate_inputs
   require_command git
-
-  local state_root
-  state_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/augure-review.XXXXXX")"
-  AUGURE_REVIEW_STATE_ROOT="$state_root"
-  trap 'rm -rf -- "$AUGURE_REVIEW_STATE_ROOT"' EXIT
-  chmod 700 "$state_root"
-
-  export AUGURE_HOME="$state_root/augure-home"
-  export CODEX_HOME="$AUGURE_HOME"
-
-  # Load only the selected provider. Each adapter implements the same functions.
-  # shellcheck source=/dev/null
-  source "$AUGURE_REVIEW_ACTION_ROOT/providers/$AUGURE_REVIEW_PROVIDER.sh"
-
-  provider_validate
-  provider_prepare_environment
-  provider_verify_head
+  require_command python3
 
   git check-ref-format --branch "$AUGURE_REVIEW_BASE_REF" >/dev/null 2>&1 ||
     die "base ref has an invalid format"
-  git rev-parse --verify "origin/${AUGURE_REVIEW_BASE_REF}^{commit}" >/dev/null 2>&1 ||
+  git rev-parse --verify "refs/remotes/origin/${AUGURE_REVIEW_BASE_REF}^{commit}" >/dev/null 2>&1 ||
     die "base ref is not available: origin/$AUGURE_REVIEW_BASE_REF"
 
-  install_augure "$state_root"
-  build_prompt "$state_root/prompt.md"
-  write_augure_config "$AUGURE_HOME" "$state_root/prompt.md" "$AUGURE_REVIEW_MODEL"
+  prepare_state_dir "$AUGURE_REVIEW_STATE_DIR"
 
-  augure \
-    --enable use_legacy_landlock \
-    --ask-for-approval never \
-    exec \
-    --model "$AUGURE_REVIEW_MODEL" \
-    --ephemeral \
-    --output-last-message "$state_root/result.txt" \
-    "Perform and publish the bounded pull request review defined by your instructions. Review only origin/$AUGURE_REVIEW_BASE_REF...$AUGURE_REVIEW_EXPECTED_HEAD_SHA."
+  # Augure's home holds only non-secret configuration, but it is kept outside
+  # the preserved state so that nothing else the CLI writes there is archived.
+  local work
+  work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/augure-review-work.XXXXXX")"
+  AUGURE_REVIEW_WORK_DIR="$work"
+  trap 'rm -rf -- "$AUGURE_REVIEW_WORK_DIR"' EXIT
+  chmod 700 "$work"
 
-  [[ -s "$state_root/result.txt" ]] || die "Augure returned no final result"
-  provider_verify_head
-  check_result "$state_root/result.txt"
+  export AUGURE_HOME="$work/augure-home"
+  export CODEX_HOME="$AUGURE_HOME"
+
+  install_augure "$AUGURE_REVIEW_CLI_VERSION" "$work"
+  write_augure_config "$AUGURE_HOME" "$AUGURE_REVIEW_MODEL"
+  cp "$AUGURE_HOME/config.toml" "$AUGURE_REVIEW_STATE_DIR/augure-config.toml"
+
+  PYTHONPATH="$AUGURE_REVIEW_ACTION_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m augure_review
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

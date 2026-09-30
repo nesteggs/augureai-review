@@ -1,5 +1,5 @@
 name: Augure review
-description: Run a bounded Augure code review through a provider adapter
+description: Run a chunked, verified Augure code review through a provider adapter
 
 inputs:
   provider:
@@ -24,11 +24,81 @@ inputs:
   expected-head-sha:
     description: Head commit that this run is allowed to review and publish
     required: true
+  augure-version:
+    description: Augure CLI release to require; the run fails if the release server publishes a different version
+    required: false
+    default: 1.0.7
+  augure-sha256:
+    description: Optional SHA-256 of the runner platform's Augure release tarball
+    required: false
+    default: ""
+  chunk-budget-bytes:
+    description: Maximum bytes of instructions and input scheduled into any one review session
+    required: false
+    default: "120000"
+  session-timeout-minutes:
+    description: Wall-clock limit for each review session
+    required: false
+    default: "12"
+  session-max-tool-calls:
+    description: Shell tool calls allowed in each review session before it is terminated
+    required: false
+    default: "12"
+  max-attempts:
+    description: Attempts for each failed or invalid review session
+    required: false
+    default: "2"
+  parallel-sessions:
+    description: Review sessions that may run concurrently
+    required: false
+    default: "2"
+  max-integration-passes:
+    description: Cross-chunk integration sessions allowed per run
+    required: false
+    default: "6"
+  layer-map-file:
+    description: Optional JSON file mapping architecture labels to path glob lists
+    required: false
+    default: ""
+  resume-dir:
+    description: Optional directory holding a previous run's artifacts; valid session results with identical inputs are reused
+    required: false
+    default: ""
+  upload-artifacts:
+    description: Upload prompts, results, and sanitized logs as a workflow artifact
+    required: false
+    default: "true"
+  artifact-name:
+    description: Artifact name; defaults to augure-review-<job>-<run attempt>
+    required: false
+    default: ""
+  artifact-retention-days:
+    description: Days to retain the review artifact
+    required: false
+    default: "14"
+
+outputs:
+  review-id:
+    description: ID of the published review
+    value: ${{ steps.review.outputs.review-id }}
+  review-url:
+    description: URL of the published review
+    value: ${{ steps.review.outputs.review-url }}
+  event:
+    description: Published review event, or none
+    value: ${{ steps.review.outputs.event }}
+  failure-category:
+    description: Failure category when the review did not complete
+    value: ${{ steps.review.outputs.failure-category }}
+  artifacts-path:
+    description: Directory containing the preserved review state
+    value: ${{ steps.review.outputs.artifacts-path }}
 
 runs:
   using: composite
   steps:
     - name: Run Augure review
+      id: review
       shell: bash
       env:
         AUGURE_REVIEW_ACTION_ROOT: ${{ github.action_path }}
@@ -39,4 +109,25 @@ runs:
         AUGURE_REVIEW_CHANGE_NUMBER: ${{ inputs.change-number }}
         AUGURE_REVIEW_BASE_REF: ${{ inputs.base-ref }}
         AUGURE_REVIEW_EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        AUGURE_REVIEW_CLI_VERSION: ${{ inputs.augure-version }}
+        AUGURE_REVIEW_CLI_SHA256: ${{ inputs.augure-sha256 }}
+        AUGURE_REVIEW_CHUNK_BUDGET_BYTES: ${{ inputs.chunk-budget-bytes }}
+        AUGURE_REVIEW_SESSION_TIMEOUT_MINUTES: ${{ inputs.session-timeout-minutes }}
+        AUGURE_REVIEW_SESSION_MAX_TOOL_CALLS: ${{ inputs.session-max-tool-calls }}
+        AUGURE_REVIEW_MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+        AUGURE_REVIEW_PARALLEL_SESSIONS: ${{ inputs.parallel-sessions }}
+        AUGURE_REVIEW_MAX_INTEGRATION_PASSES: ${{ inputs.max-integration-passes }}
+        AUGURE_REVIEW_LAYER_MAP_FILE: ${{ inputs.layer-map-file }}
+        AUGURE_REVIEW_RESUME_DIR: ${{ inputs.resume-dir }}
+        AUGURE_REVIEW_STATE_DIR: ${{ runner.temp }}/augure-review-${{ github.job }}-${{ github.run_attempt }}
       run: bash "$AUGURE_REVIEW_ACTION_ROOT/scripts/run-review.sh"
+
+    - name: Upload Augure review artifacts
+      if: always() && inputs.upload-artifacts == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name || format('augure-review-{0}-{1}', github.job, github.run_attempt) }}
+        path: ${{ runner.temp }}/augure-review-${{ github.job }}-${{ github.run_attempt }}
+        retention-days: ${{ inputs.artifact-retention-days }}
+        if-no-files-found: ignore
+        include-hidden-files: true
