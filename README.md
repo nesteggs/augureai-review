@@ -1,8 +1,12 @@
 # Augure AI Review
 
-A reusable GitHub composite action that runs an Augure pull request review with a repository-supplied review policy. The current implementation uses a single model session; chunked review is proposed separately and is not implemented here.
+Run Augure pull request reviews with your repository's review policy.
 
-## Usage
+## GitHub Action
+
+Add the action to your GitHub workflow with `uses: nesteggs/augureai-review@main`.
+
+### Usage
 
 Check out the PR head with full history and fetch its base branch before invoking the action. The action verifies that the PR head matches `expected-head-sha` before and after the review.
 
@@ -40,7 +44,7 @@ steps:
 
 The example assumes a `pull_request` workflow limited to non-draft, same-repository PRs. Fork PR tokens generally cannot publish reviews. Consumers can pin a published commit instead of `main`.
 
-`prompt-file` points to the consuming repository's policy. Repository-specific review standards stay with that repository. The GitHub adapter adds the publication contract and untrusted-input rules.
+`prompt-file` points to your repository's review policy.
 
 The runner needs Bash, Git, curl, the GitHub CLI, and jq. The action installs Augure during execution. Credentials are supplied through environment variables and must not be committed.
 
