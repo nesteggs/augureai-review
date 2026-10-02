@@ -223,6 +223,10 @@ test_main_with_mocks() {
     fail 'secrets were written to the preserved state'
   fi
   [[ -z "$(ls -A "$test_dir/runner-temp")" ]] || fail 'the work directory was not removed'
+  grep -Fq 'tool call 1 (command_execution)' "$test_dir/main.log" || fail 'tool calls were not logged'
+  if grep -Fq 'git diff' "$test_dir/main.log"; then
+    fail 'the run log must not show tool command text'
+  fi
   grep -Fq '"--ephemeral"' "$test_dir/augure.log" || fail 'sessions must be ephemeral'
   grep -Fq '"--output-schema"' "$test_dir/augure.log" || fail 'sessions must use structured output'
   if grep -Fq -- '--effort' "$test_dir/augure.log"; then

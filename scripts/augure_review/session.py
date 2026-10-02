@@ -153,7 +153,8 @@ def run_session(
                 with lock:
                     if kind == "item.started" and item.get("type") in TOOL_ITEM_TYPES:
                         outcome.tool_calls += 1
-                        log(f"{name}: tool call {outcome.tool_calls}: {str(item.get('command', item.get('type')))[:160]}")
+                        # Commands can quote repository secrets; they stay in events.jsonl.
+                        log(f"{name}: tool call {outcome.tool_calls} ({item.get('type')})")
                         if outcome.tool_calls > settings.session_max_tool_calls and outcome.termination is None:
                             outcome.termination = "tool-budget"
                             _terminate(process)
