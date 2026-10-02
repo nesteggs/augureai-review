@@ -1,0 +1,22 @@
+Hey Chris, FIND-2226 phase 1 (Alberta PBF → PostGIS → mbtiles) is built and passing its tests locally on `dev/ss/find-2226-osm-etl`. Nothing is deployed or committed yet. Before I open the PR, could you look over the places where I changed your plan or where the plan left the choice open? Replying by number is fine.
+
+*Changes to the locked plan*
+1. *Prod promote keeps a backup.* Decision 6 said drop and recreate prod `osm`. Instead, one transaction renames prod `osm` to `osm_backup` and restores the new copy. Any failure rolls back, so prod is never half-empty. The cost is two copies of `osm` on prod. Keep this, or go back to a plain drop?
+2. *Silver PV/PVC sits in the osm service.* The tile job publishes to `silver-prod` through a new static PV `silver-prod-platform-osm-pv` (same share and storage class as the pirm PV, new volumeHandle, Retain) and PVC `silver-prod-pvc` in `platform-osm`. 07 says lake owns storage and silver stays untouched. The existing silver PVs aren't touched, but this is a new read-write mount of the prod silver share. Keep it in osm for now, or move it into lake?
+3. *`piste` added, `housenumber` dropped.* The plan's 16 layers include `piste`, but OMT v3.15 has no `piste` (its 16th layer is `housenumber`). I wrote a FIND `piste` layer in OMT format and dropped `housenumber`, which the outdoors style doesn't read. OK?
+4. *No osmborder, no wikidata.* 04 asked for the full aux stack. openmaptiles-tools 7.2 removed the osmborder import (v3.15 builds boundaries from OSM relations). Wikidata only adds `name:<lang>` keys the style never reads, and it queries a live endpoint. Staged instead: Natural Earth 5.1.2, water polygons, lake centerlines. The tile job refreshes them every 90 days rather than separate jobs doing it. OK?
+5. *New branch off `main`.* I copied your `dev/pr/osm-pbf-sync` files onto a fresh branch off main and reworked them, so your 8 commits aren't kept. OK for my branch to replace yours as one PR?
+
+*Choices the plan left open*
+6. *The tile job has its own PostGIS, not `gis_common`.* Monthly CronJob `osm-tiles`, 1st of the month at 04:00 Edmonton time. A PostGIS sidecar in the pod (`openmaptiles/postgis:7.2`, PG 14, pinned by digest, pulled from Docker Hub) re-imports the PBF each run and is thrown away afterwards. That means the weekly `gis_common` sync has no consumer yet. OK with both that and pulling this image into the cluster?
+7. *Tile job sizing.* 128Gi PGDATA + 256Gi scratch on `managed-premium` ephemeral disks, memory limits of 16Gi (PostGIS) and 8Gi (build), 12h deadline, amd64 nodes only. A full-province local run took 17 min, peaked under 5 GiB per container and produced a 2.47 GB z16 file, so the margins are wide. OK for isla-nublar?
+8. *Silver output layout.* Each build lands in `/silver-prod/osm/basemaps/alberta/<YYYYMMDD>/` as `find-basemap-<YYYYMMDD>.mbtiles` plus `.sha256` and `manifest.json`. The region folder also gets `latest.json` and an `updated` marker. The last 3 versions are kept. The phase 2 `/api/basemaps` endpoints would read this layout. Good as the contract?
+9. *Bronze grows.* Each tile run saves that day's PBF in bronze: about 330 MB a month on top of the quarterly snapshots, with no pruning (per decision 4). OK, or should the tile job reuse the newest snapshot?
+
+*A few things on your side, whenever you get a chance*
+• Could you push `dev/pr/find-2226-1-storage`? The osm jobs mount `bronze-prod-pvc` from lake. Also, since `lake.tf` isn't on main yet, a `tofu apply` from main would try to destroy the `bronze-prod` share.
+• Do you know if the `gis_common` app user can run `CREATE EXTENSION hstore` on test and prod? The OMT mapping needs it. If it can't, it would just need one run as superuser.
+• At some point before a promote runs, it'd be worth checking that `gis-common-prod-app` logs in as the `gis_common` owner. I noticed insight uses `gis-common-prod-app-workaround` because the prod app role can't read the existing tables. No rush, since nothing gets promoted until prod has a consumer.
+• I noticed the shared `pushService` in `tasks/lib/service.ts` pushes `<image>:null` (its `withTag` override never sets the tag the push uses). The osm `push` task works around it for now. troodon, terrasaur, martin and mosasaur use it too, so would you rather I fix it in this PR or leave it for a separate ticket?
+
+The runbook has every command: `services/platform/osm/README.md`. Thanks!

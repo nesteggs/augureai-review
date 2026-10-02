@@ -101,8 +101,7 @@ def main():
     paths = {path for _, path in units}
 
     if stage == "chunk" and os.environ.get("MOCK_AUGURE_QUOTA_PATH") in paths:
-        emit({"type": "error", "message": "Daily limit reached (100% used) (Daily usage guard reached)"})
-        emit({"type": "turn.failed", "error": {"message": "Daily limit reached (100% used)"}})
+        emit({"type": "turn.failed", "error": {"message": os.environ["MOCK_AUGURE_QUOTA_MESSAGE"]}})
         return 1
     if stage == "chunk" and os.environ.get("MOCK_AUGURE_FAIL_PATH") in paths:
         emit({"type": "turn.failed", "error": {"message": "mock failure"}})

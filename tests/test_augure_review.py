@@ -734,15 +734,28 @@ class PipelineTests(unittest.TestCase):
 
     def test_usage_limit_stops_the_review_without_publishing(self):
         self.add_large_change()
+        messages = [
+            "Daily limit reached (100% used) \u2014 your weekly allowance has a daily limit (Daily usage guard reached)",
+            "Weekly allowance used (100% used) \u2014 capacity returns as earlier use ages out",
+        ]
 
-        _, failure = self.run_pipeline(
-            {"MOCK_AUGURE_QUOTA_PATH": "web/page.tsx"}, chunk_budget_bytes=30_000, parallel_sessions=1
-        )
+        for message in messages:
+            with self.subTest(message=message):
+                state_dir = Path(self.temp.name) / f"state-{messages.index(message)}"
+                log = Path(self.environment["MOCK_AUGURE_LOG"])
+                log.unlink(missing_ok=True)
 
-        self.assertEqual(failure.category, "quota")
-        self.assertEqual(list(self.state_dir.glob("sessions/*/attempt-2")), [])
-        self.assertNotIn("integration", [s["stage"] for s in self.sessions()])
-        self.assertEqual(self.published(), [])
+                _, failure = self.run_pipeline(
+                    {"MOCK_AUGURE_QUOTA_PATH": "web/page.tsx", "MOCK_AUGURE_QUOTA_MESSAGE": message},
+                    state_dir=state_dir,
+                    chunk_budget_bytes=30_000,
+                    parallel_sessions=1,
+                )
+
+                self.assertEqual(failure.category, "quota")
+                self.assertEqual(list(state_dir.glob("sessions/*/attempt-2")), [])
+                self.assertNotIn("integration", [s["stage"] for s in self.sessions()])
+                self.assertEqual(self.published(), [])
 
     def test_resume_reuses_matching_results_only(self):
         self.run_pipeline()

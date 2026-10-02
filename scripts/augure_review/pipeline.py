@@ -20,7 +20,9 @@ from .settings import Settings
 from .state import RunState, append_summary, set_outputs
 
 AUTH_FAILURE = re.compile(r"\b(401 Unauthorized|403 Forbidden)\b")
-QUOTA_FAILURE = re.compile(r"(?i)\b(daily limit reached|usage guard|usage limit)\b")
+# Augure reports exhausted allowances as, for example, "Daily limit reached (100%
+# used)" and "Weekly allowance used (100% used)".
+QUOTA_FAILURE = re.compile(r"(?i)\b(limit reached|allowance used|usage guard|usage limit)\b|\(100% used\)")
 # Room for a retry note appended to a rejected session's prompt.
 RETRY_RESERVE = 1_200
 # Room for headings, related-chunk lists, and delimiters, plus a retry note.
